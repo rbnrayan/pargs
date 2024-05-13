@@ -13,15 +13,13 @@
 
 #define pargs_free(pargs) free(pargs)
 
-enum P_ArgsType {
-    LONG_NAME,
-    SHORT_NAME,
-    VALUE,
-    EOA
+enum P_ArgsNameType {
+    LONG,
+    SHORT
 };
 
 struct P_ArgsOption {
-  enum P_ArgsType type;
+  enum P_ArgsNameType name_type;
   union {
     char *long_name;
     char short_name;
