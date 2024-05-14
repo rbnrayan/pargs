@@ -15,6 +15,7 @@
         }                                                                                  \
         (da)->items[(da)->size++] = (item);                                                \
     } while (0)
+#define da_free(da) free((da)->items)
 
 #define EOA_STR "--"
 
@@ -22,7 +23,6 @@ enum P_ArgsTokenType {
     NAME_LONG,
     NAME_SHORT,
     VALUE,
-    EQUAL,
     EOA
 };
 
@@ -42,11 +42,16 @@ struct P_ArgsLexer {
     size_t args_offset, ch_offset;
 };
 
-typedef struct {
+struct Tokens {
     struct P_ArgsToken *items;
     size_t capacity;
     size_t size;
-} Tokens;
+};
+
+struct P_ArgsParser {
+    struct Tokens *tokens;
+    size_t offset;
+};
 
 static void pargs_panic(const char *msg)
 {
@@ -65,7 +70,7 @@ static char *shift_args(int *argc, char ***argv)
     return arg;
 }
 
-static size_t find_first_equal(const char *src, size_t len)
+static long find_first_equal(const char *src, size_t len)
 {
     for (size_t i = 0; i < len; ++i) {
         if (src[i] == '=')
@@ -75,12 +80,28 @@ static size_t find_first_equal(const char *src, size_t len)
     return -1;
 }
 
-static void init_lexer(struct P_ArgsLexer *lexer, int argc, char **argv)
+static void init_lexer(struct P_ArgsLexer *lexer, int *argc, char ***argv)
 {
     lexer->args_offset = 0;
     lexer->ch_offset = 0;
-    lexer->args_count = argc;
-    lexer->args = argv;
+    lexer->args_count = *argc;
+    lexer->args = malloc(sizeof(char *) * (*argc));
+    memset(lexer->args, 0, lexer->args_count);
+
+    if (lexer->args == NULL)
+        pargs_panic("failed to allocate memory for lexer");
+
+    size_t i = 0;
+    char *arg = shift_args(argc, argv);
+    while (arg != NULL && strcmp(EOA_STR, arg) != 0) {
+        lexer->args[i++] = arg;
+        arg = shift_args(argc, argv);
+    }
+}
+
+static void free_lexer(struct P_ArgsLexer *lexer)
+{
+    free(lexer->args);
 }
 
 static struct P_ArgsToken lex_next_token(struct P_ArgsLexer *lexer)
@@ -97,24 +118,24 @@ static struct P_ArgsToken lex_next_token(struct P_ArgsLexer *lexer)
 
     if (lexer->ch_offset == 0 && current_arg[lexer->ch_offset] == '-') {
         if (current_arg_len > 2 && current_arg[lexer->ch_offset+1] == '-') {
-            // TODO: handle EQUAL
-            //
-            // Maybe use `StrSlice { char *s, size_t len };`
-            // to determine name.
-
             token.type = NAME_LONG;
             token.name_long_value = current_arg + 2;
 
-            lexer->args_offset += 1;
+            long equal_idx = find_first_equal(current_arg, current_arg_len);
+            if (equal_idx > 0) {
+                current_arg[equal_idx] = '\0';
+                lexer->ch_offset = equal_idx + 1;
+            } else {
+                lexer->args_offset += 1;
+            }
         } else if (current_arg_len > 2) {
             token.type = NAME_SHORT;
             token.name_short_value = *(current_arg + 1);
 
             lexer->ch_offset += 2;
         } else {
-            if (current_arg_len < 2) {
+            if (current_arg_len < 2)
                 pargs_panic("no character provided for short named option");
-            }
 
             token.type = NAME_SHORT;
             token.name_short_value = *(current_arg + 1);
@@ -132,8 +153,42 @@ static struct P_ArgsToken lex_next_token(struct P_ArgsLexer *lexer)
     return token;
 }
 
-static void parse_tokens(P_Args *pargs, Tokens *tokens)
+static struct P_ArgsOption parse_next_option(struct P_ArgsParser *parser)
 {
+    struct P_ArgsOption opt = { 0 };
+    
+    struct P_ArgsToken token = parser->tokens->items[parser->offset++];
+    switch (token.type) {
+    case NAME_LONG:
+        opt.name_type = LONG;
+        opt.long_name = token.name_long_value;
+        break;
+    case NAME_SHORT:
+        opt.name_type = SHORT;
+        opt.short_name = token.name_short_value;
+        break;
+    case VALUE:
+    case EOA:
+        pargs_panic("unexpected token while parsing");
+    }
+
+    token = parser->tokens->items[parser->offset];
+    if (token.type == VALUE) {
+        opt.value = token.value;
+        parser->offset += 1;
+    }
+
+    return opt;
+}
+
+static void parse_tokens(P_Args *pargs, struct P_ArgsParser *parser)
+{
+    size_t i = 0;
+    struct P_ArgsOption opt = parse_next_option(parser);
+    while (parser->offset < parser->tokens->size) {
+        pargs->options[i++] = opt;
+        opt = parse_next_option(parser);
+    }
 }
 
 P_Args *pargs_parse(int *argc, char ***argv)
@@ -142,20 +197,25 @@ P_Args *pargs_parse(int *argc, char ***argv)
     shift_args(argc, argv);
 
     struct P_ArgsLexer lexer = { 0 };
-    init_lexer(&lexer, *argc, *argv);
+    init_lexer(&lexer, argc, argv);
 
-    Tokens tokens = { 0 };
+    struct Tokens tokens = { 0 };
     struct P_ArgsToken token;
-    while ((token = lex_next_token(&lexer)).type != EOA) {
+    while ((token = lex_next_token(&lexer)).type != EOA)
         da_append(&tokens, token);
-    }
 
     P_Args *pargs = malloc(sizeof(P_Args));
     memset(pargs->options, 0, PARGS_CAPACITY);
     pargs->size = 0;
 
-    parse_tokens(pargs, &tokens);
+    struct P_ArgsParser parser = {
+        .tokens = &tokens,
+        .offset = 0
+    };
+    parse_tokens(pargs, &parser);
 
+    da_free(&tokens);
+    free_lexer(&lexer);
     return pargs;
 }
 
@@ -166,9 +226,8 @@ const char *pargs_getl(P_Args *pargs, const char *name)
             continue;
         
         const struct P_ArgsOption option = pargs->options[i];
-        if (strcmp(name, option.name.long_name) == 0) {
+        if (strcmp(name, option.long_name) == 0)
             return option.value;
-        }
     }
     return NULL;
 }
@@ -180,9 +239,8 @@ const char *pargs_gets(P_Args *pargs, char name)
             continue;
 
         const struct P_ArgsOption option = pargs->options[i];
-        if (option.name.short_name == name) {
+        if (option.short_name == name)
             return option.value;
-        }
     }
     return NULL;
 }

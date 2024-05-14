@@ -23,7 +23,7 @@ struct P_ArgsOption {
   union {
     char *long_name;
     char short_name;
-  } name;
+  };
   char *value;
 };
 
